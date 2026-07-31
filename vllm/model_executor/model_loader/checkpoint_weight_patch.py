@@ -13,7 +13,6 @@ from __future__ import annotations
 import math
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import NamedTuple
 
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
@@ -46,39 +45,23 @@ class CheckpointWeightPatch:
     indices: torch.Tensor | None = None
 
 
-class _CopyRecord(NamedTuple):
-    destination: torch.Tensor
-    original: torch.Tensor
-    update_mask: torch.Tensor | None
-
-
 class _SparsePatchCopyMode(TorchDispatchMode):
-    """Record where the model loader finally copies each checkpoint weight.
+    """Validate where the model loader finally copies each checkpoint weight.
 
     Model loaders may rename a weight, slice it for TP, or place it in part of
-    a packed parameter. After loading, NaN positions are restored from the old
-    runtime value. Each runtime view must receive exactly one same-shaped
-    floating-point copy.
+    a packed parameter. Each supported copy merges the NaN-masked checkpoint
+    source with the runtime destination before writing it. Each runtime view
+    must receive exactly one same-shaped floating-point copy.
     """
 
     def __init__(self, model: torch.nn.Module):
         super().__init__()
-        self._records: dict[tuple, _CopyRecord] = {}
+        self._destinations: list[torch.Tensor] = []
         self._runtime_storages = {
             tensor.untyped_storage().data_ptr()
             for tensor in (*model.parameters(), *model.buffers())
             if tensor.numel()
         }
-
-    @staticmethod
-    def _key(tensor: torch.Tensor) -> tuple:
-        return (
-            tensor.untyped_storage().data_ptr(),
-            tensor.storage_offset(),
-            tuple(tensor.shape),
-            tuple(tensor.stride()),
-            tensor.device,
-        )
 
     @staticmethod
     def _storage_range(tensor: torch.Tensor) -> tuple[int, int]:
@@ -139,22 +122,16 @@ class _SparsePatchCopyMode(TorchDispatchMode):
                 if self._is_runtime_tensor(tensor)
             )
 
-    def _record_copy(
+    def _record_destination(
         self,
         destination: torch.Tensor,
-        update_mask: torch.Tensor | None,
     ) -> None:
-        key = self._key(destination)
-        for record in self._records.values():
-            if self._views_may_overlap(destination, record.destination):
+        for previous in self._destinations:
+            if self._views_may_overlap(destination, previous):
                 raise NotImplementedError(
                     "sparse checkpoint patches cannot write overlapping runtime views"
                 )
-        self._records[key] = _CopyRecord(
-            destination=destination,
-            original=destination.clone(),
-            update_mask=update_mask,
-        )
+        self._destinations.append(destination)
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
@@ -168,8 +145,9 @@ class _SparsePatchCopyMode(TorchDispatchMode):
                 and dst.shape == src.shape
             ):
                 cast = src.to(dtype=dst.dtype, device=dst.device)
-                self._record_copy(dst, ~torch.isnan(cast))
-                args = (dst, cast, *args[2:])
+                self._record_destination(dst)
+                merged = torch.where(torch.isnan(cast), dst, cast)
+                args = (dst, merged, *args[2:])
             else:
                 raise NotImplementedError(
                     "sparse checkpoint patches require a same-shaped floating-point "
@@ -182,24 +160,11 @@ class _SparsePatchCopyMode(TorchDispatchMode):
             )
         return func(*args, **kwargs)
 
-    def rollback(self) -> None:
-        for record in reversed(self._records.values()):
-            record.destination.copy_(record.original)
-
-    def commit(self, *, allow_no_write: bool) -> None:
-        if not self._records and not allow_no_write:
+    def validate(self, *, allow_no_write: bool) -> None:
+        if not self._destinations and not allow_no_write:
             raise NotImplementedError(
                 "the model loader reported a sparse checkpoint weight without "
                 "copying it into a runtime destination"
-            )
-        for record in self._records.values():
-            assert record.update_mask is not None
-            record.destination.copy_(
-                torch.where(
-                    record.update_mask,
-                    record.destination,
-                    record.original,
-                )
             )
 
 
@@ -249,14 +214,10 @@ def _load_chunk(
         return set()
     if sparse:
         mode = _SparsePatchCopyMode(model)
-        try:
-            with mode:
-                loaded = model.load_weights(weights)
-            allow_no_write = loaded is not None and not loaded
-            mode.commit(allow_no_write=allow_no_write)
-        except BaseException:
-            mode.rollback()
-            raise
+        with mode:
+            loaded = model.load_weights(weights)
+        allow_no_write = loaded is not None and not loaded
+        mode.validate(allow_no_write=allow_no_write)
     else:
         loaded = model.load_weights(weights)
     return set() if loaded is None else set(loaded)
@@ -280,8 +241,9 @@ def load_checkpoint_weight_patches(
 
     The caller wraps dense updates in vLLM's layerwise reload lifecycle. Sparse
     updates modify initialized runtime tensors and must not run that lifecycle.
-    Metadata is checked before loading, while rollback is limited to the
-    destinations touched by one internal ``model.load_weights`` call.
+    Metadata is checked before loading. Loader failures propagate without
+    restoring destinations, so callers must stop using and restart a worker
+    after a failed update.
 
     Args:
         model: Model whose native ``load_weights`` method applies the patches.

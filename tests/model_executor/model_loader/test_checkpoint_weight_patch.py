@@ -3,6 +3,7 @@
 
 import pytest
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from vllm.model_executor.model_loader.checkpoint_weight_patch import (
     CheckpointWeightPatch,
@@ -62,6 +63,68 @@ def test_sparse_patch_preserves_values_after_tp_narrow():
 
     assert torch.equal(model.weight, torch.tensor([0.0, 30.0]))
     assert loaded == {"global.weight"}
+
+
+class _InspectingCheckpointPatchModel(_CheckpointPatchModel):
+    def __init__(self):
+        super().__init__()
+        self.weight_after_copy: torch.Tensor | None = None
+
+    def load_weights(self, weights):
+        loaded = super().load_weights(weights)
+        self.weight_after_copy = self.weight.detach().clone()
+        return loaded
+
+
+def test_sparse_patch_merges_before_runtime_copy_returns():
+    model = _InspectingCheckpointPatchModel()
+
+    load_checkpoint_weight_patches(
+        model,
+        [_sparse_patch(index=3, value=30.0)],
+    )
+
+    assert model.weight_after_copy is not None
+    assert torch.equal(model.weight_after_copy, torch.tensor([0.0, 30.0]))
+
+
+class _RuntimeOperationCounter(TorchDispatchMode):
+    def __init__(self, model: torch.nn.Module):
+        super().__init__()
+        self.copied_numel = 0
+        self.cloned_numel = 0
+        self._runtime_storages = {
+            tensor.untyped_storage().data_ptr()
+            for tensor in (*model.parameters(), *model.buffers())
+            if tensor.numel()
+        }
+
+    def _is_runtime_tensor(self, tensor):
+        return (
+            isinstance(tensor, torch.Tensor)
+            and tensor.numel()
+            and tensor.untyped_storage().data_ptr() in self._runtime_storages
+        )
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        if func is torch.ops.aten.copy_.default and self._is_runtime_tensor(args[0]):
+            self.copied_numel += args[0].numel()
+        elif func is torch.ops.aten.clone.default and self._is_runtime_tensor(args[0]):
+            self.cloned_numel += args[0].numel()
+        return func(*args, **(kwargs or {}))
+
+
+def test_sparse_patch_writes_runtime_destination_once_without_snapshot():
+    model = _CheckpointPatchModel()
+
+    with _RuntimeOperationCounter(model) as counter:
+        load_checkpoint_weight_patches(
+            model,
+            [_sparse_patch(index=3, value=30.0)],
+        )
+
+    assert counter.copied_numel == model.weight.numel()
+    assert counter.cloned_numel == 0
 
 
 def test_dense_patch_uses_checkpoint_to_runtime_narrow():
@@ -151,7 +214,7 @@ class _ComposedCheckpointPatchModel(torch.nn.Module):
         return {"global.weight"}
 
 
-def test_composed_loader_is_rejected_and_rolled_back():
+def test_composed_loader_error_leaves_the_first_copy_applied():
     model = _ComposedCheckpointPatchModel()
     original = model.weight.detach().clone()
     patch = _sparse_patch(index=0, value=2.0, shape=(2,))
@@ -159,7 +222,9 @@ def test_composed_loader_is_rejected_and_rolled_back():
     with pytest.raises(NotImplementedError, match="overlapping runtime views"):
         load_checkpoint_weight_patches(model, [patch])
 
-    assert torch.equal(model.weight, original)
+    expected = original.clone()
+    expected[0] = 2.0
+    assert torch.equal(model.weight, expected)
 
 
 class _PostCopyMutationModel(torch.nn.Module):
@@ -174,9 +239,8 @@ class _PostCopyMutationModel(torch.nn.Module):
         return {"global.weight"}
 
 
-def test_post_copy_mutation_is_rejected_and_rolled_back():
+def test_post_copy_mutation_error_leaves_the_copy_applied():
     model = _PostCopyMutationModel()
-    original = model.weight.detach().clone()
 
     with pytest.raises(NotImplementedError, match="only support copy_"):
         load_checkpoint_weight_patches(
@@ -184,7 +248,7 @@ def test_post_copy_mutation_is_rejected_and_rolled_back():
             [_sparse_patch(index=0, value=20.0, shape=(2,))],
         )
 
-    assert torch.equal(model.weight, original)
+    assert torch.equal(model.weight, torch.tensor([20.0, 1.0]))
 
 
 class _UnsupportedCopyModel(torch.nn.Module):
@@ -198,7 +262,7 @@ class _UnsupportedCopyModel(torch.nn.Module):
         return {"global.weight"}
 
 
-def test_unsupported_copy_is_rejected_and_rolled_back():
+def test_unsupported_copy_is_rejected_before_writing():
     model = _UnsupportedCopyModel()
     original = model.weight.detach().clone()
     patch = _sparse_patch(index=0, value=20.0, shape=(2,))
@@ -226,9 +290,8 @@ class _OverlappingCheckpointPatchModel(torch.nn.Module):
         return {name for name, _ in weights}
 
 
-def test_overlapping_runtime_views_are_rejected_and_rolled_back():
+def test_overlapping_runtime_view_error_keeps_the_first_write():
     model = _OverlappingCheckpointPatchModel()
-    original = model.weight.detach().clone()
     patches = [
         CheckpointWeightPatch(
             name="left.weight",
@@ -249,7 +312,7 @@ def test_overlapping_runtime_views_are_rejected_and_rolled_back():
     with pytest.raises(NotImplementedError, match="overlapping runtime views"):
         load_checkpoint_weight_patches(model, patches)
 
-    assert torch.equal(model.weight, original)
+    assert torch.equal(model.weight, torch.tensor([10.0, 1.0, 2.0, 3.0]))
 
 
 class _IgnoredCheckpointPatchModel(torch.nn.Module):
@@ -277,9 +340,8 @@ class _FailingCheckpointPatchModel(_CheckpointPatchModel):
         raise RuntimeError("loader failed")
 
 
-def test_loader_error_restores_destinations():
+def test_loader_error_leaves_the_applied_destination():
     model = _FailingCheckpointPatchModel()
-    original = model.weight.detach().clone()
 
     with pytest.raises(RuntimeError, match="loader failed"):
         load_checkpoint_weight_patches(
@@ -287,7 +349,7 @@ def test_loader_error_restores_destinations():
             [_sparse_patch(index=3, value=30.0)],
         )
 
-    assert torch.equal(model.weight, original)
+    assert torch.equal(model.weight, torch.tensor([0.0, 30.0]))
 
 
 def test_nan_values_are_rejected_before_loading():
@@ -341,7 +403,7 @@ def test_masked_copy_is_scoped_to_model_loading():
     assert torch.isnan(model.weight).all()
 
 
-def test_failure_only_rolls_back_the_current_loader_call():
+def test_later_chunk_error_keeps_all_applied_writes():
     model = _CheckpointPatchModel()
     patches = [
         _sparse_patch(index=2, value=20.0),
@@ -364,4 +426,4 @@ def test_failure_only_rolls_back_the_current_loader_call():
             max_chunk_bytes=1,
         )
 
-    assert torch.equal(model.weight, torch.tensor([20.0, 1.0]))
+    assert torch.equal(model.weight, torch.tensor([20.0, 30.0]))
