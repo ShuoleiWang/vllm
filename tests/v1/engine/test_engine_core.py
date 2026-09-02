@@ -22,6 +22,7 @@ from vllm.config import (
 from vllm.engine.arg_utils import EngineArgs
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_default_torch_num_threads
+from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.core import EngineCore, EngineCoreProc
 from vllm.v1.executor.abstract import Executor
@@ -642,3 +643,32 @@ def test_pause_synchronizes_device_before_cache_reset(deferred: bool):
     else:
         assert result is None
     assert order == ["synchronize_device", "reset_caches"]
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+def test_pause_fails_closed_when_cache_reset_is_rejected(deferred: bool):
+    core = _pausable_engine_core_proc()
+    core.engines_running = deferred
+    core.reset_prefix_cache = MagicMock(return_value=False)
+    core.reset_mm_cache = MagicMock()
+    core.reset_encoder_cache = MagicMock()
+    error_match = "Failed to reset the prefix cache or external KV connector cache"
+
+    if deferred:
+        result = EngineCoreProc.pause_scheduler(core, mode="keep", clear_cache=True)
+        assert isinstance(result, Future)
+        core.engines_running = False
+        core._notify_idle_state_callbacks()
+        with pytest.raises(RuntimeError, match=error_match):
+            result.result(timeout=0)
+    else:
+        with pytest.raises(RuntimeError, match=error_match):
+            EngineCoreProc.pause_scheduler(core, mode="keep", clear_cache=True)
+
+    core.scheduler.set_pause_state.assert_called_once_with(PauseState.PAUSED_ALL)
+    core.model_executor.collective_rpc.assert_called_once_with("synchronize_device")
+    core.reset_prefix_cache.assert_called_once_with(
+        reset_running_requests=True, reset_connector=True
+    )
+    core.reset_mm_cache.assert_called_once_with()
+    core.reset_encoder_cache.assert_called_once_with()
