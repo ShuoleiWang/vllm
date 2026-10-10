@@ -11,6 +11,7 @@ steps:
   - vllm/
   - "!vllm/distributed/kv_transfer/"
   - tests/entrypoints/rl
+  - examples/rl/abort_resume_weight_versions.py
   commands:
   - pytest -v -s entrypoints/rl/weight_transfer
   - export VLLM_WORKER_MULTIPROC_METHOD=spawn

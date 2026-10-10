@@ -51,7 +51,24 @@ With `VLLM_SERVER_DEV_MODE=1`, the vLLM HTTP server exposes the same functionali
 
 ## Typical Async RL Flow
 
-A typical async RL loop with weight syncing looks like this:
+### Abort and resubmit
+
+An abort-first controller can stop requests at a weight-update boundary and save their partial rollouts:
+
+1. Await `pause_generation(mode="abort", clear_cache=True)` on the relevant engines.
+2. Collect each request's terminal output, including an empty final streaming chunk. The pause acknowledgment alone does not mean the client has consumed that output.
+3. Save the partial tokens, their original sampled-token logprob values and `logprobs_mode`, and `weight_versions`.
+4. Transfer the new weights and await `finish_weight_update(weight_version=...)` before resuming generation.
+5. Resubmit each aborted request with the retained tokens appended to its prompt and the remaining token budget.
+6. Append the new output to the logical rollout. Shift its spans by the number of previously retained output tokens, and preserve the original logprobs for those tokens.
+
+For example, an aborted request returning `A [0, 30)` followed by a new request returning `B [0, 70)` becomes `A [0, 30), B [30, 100)` in the trainer's rollout. Prompt and tool-observation tokens need their own training masks; they are not generated-token version spans.
+
+The [reference controller helper](../../examples/rl/abort_resume_weight_versions.py) demonstrates one cycle with a dedicated `AsyncLLM`, `n=1`, cumulative outputs, and ordinary sampling. The caller supplies sampling parameters and weight transfer between the helper's start/finish calls, and can use `save_partial` to persist the prefix before the update. It is not a complete training loop or a checkpoint of RNG, penalty, or structured-decoding state. The helper records the engine's `logprobs_mode`; raw logprobs must not be assumed to include temperature/top-p processing. If an update fails, the controller must recover before resuming.
+
+### Keep in-flight requests
+
+A loop that preserves requests in the engine instead looks like this:
 
 1. Start generating rollouts from the current policy
 2. Once trainer has new weights to update to, pause generation with `mode="keep"`
@@ -76,6 +93,12 @@ for span in completion.weight_versions:
 
 The offsets cover the whole output, so with streamed delta outputs, collect the tokens before slicing. `/inference/v1/generate` returns the same list on each choice; see [Tokens In <> Tokens Out API](../serving/online_serving/token_in_token_out.md#weight-versions).
 
+OpenAI chat and completions requests can opt in with `return_weight_versions: true`. Each choice then carries `weight_versions` on the full response or its final streaming chunk, including aborts. Other responses omit the field. Set `return_token_ids: true` too when the controller needs exact generated-token coordinates. With echoed prompts, span indexes still follow the raw generated `token_ids`, not rendered text; echo-only prompt scoring can expose an internal sample in those IDs. Use `echo=false` for rollout collection.
+
+The Python `LLM` and `AsyncLLM` `finish_weight_update(weight_version=...)` paths commit the label in the same EngineCore call that finishes the worker update. Worker failures and draft-only updates leave the target label unchanged. This is a per-engine ordering guarantee, not a transaction across independent replicas; the controller must keep failed updates paused. The initial label must be set before admitting rollouts, and version-to-checkpoint mapping remains the controller's responsibility.
+
 ## Example
 
 The [async RLHF example](../../examples/rl/rlhf_async_new_apis.py) demonstrates this pattern with `vllm.AsyncLLMEngine`, NCCL weight transfer, and mid-flight pause/resume with validation.
+
+For the implementation rationale, support boundaries, and follow-up plan, see the [weight provenance design reference](../design/async_rl_weight_provenance_reference.md).

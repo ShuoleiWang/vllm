@@ -374,8 +374,9 @@ class OpenAIServingCompletion(GenerateBaseServing):
                             not delta_text
                             and not delta_token_ids
                             and not previous_num_tokens[i]
+                            and finish_reason is None
                         ):
-                            # Chunked prefill case, don't return empty chunks
+                            # Skip empty prefill chunks, but always send termination.
                             continue
 
                     if request.logprobs is not None:
@@ -412,6 +413,12 @@ class OpenAIServingCompletion(GenerateBaseServing):
                                 text=delta_text,
                                 logprobs=logprobs,
                                 finish_reason=finish_reason,
+                                weight_versions=(
+                                    output.weight_versions
+                                    if request.return_weight_versions
+                                    and finish_reason is not None
+                                    else None
+                                ),
                                 stop_reason=stop_reason,
                                 prompt_token_ids=prompt_token_ids_to_return,
                                 token_ids=(
@@ -583,6 +590,11 @@ class OpenAIServingCompletion(GenerateBaseServing):
                     text=output_text,
                     logprobs=logprobs,
                     finish_reason=output.finish_reason,
+                    weight_versions=(
+                        output.weight_versions
+                        if request.return_weight_versions
+                        else None
+                    ),
                     stop_reason=output.stop_reason,
                     prompt_logprobs=final_res.prompt_logprobs,
                     prompt_token_ids=(

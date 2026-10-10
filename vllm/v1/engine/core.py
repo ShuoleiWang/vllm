@@ -136,6 +136,7 @@ class EngineCore:
         self.log_stats = log_stats
         # Opaque weight version supplied by the caller.
         self._weight_version = "default"
+        self._weight_update_is_draft = False
 
         # Setup Model.
         self.model_executor = executor_class(vllm_config)
@@ -1072,7 +1073,20 @@ class EngineCore:
         args: tuple = (),
         kwargs: dict[str, Any] | None = None,
     ) -> list[_R]:
-        return self.model_executor.collective_rpc(method, timeout, args, kwargs)
+        results = self.model_executor.collective_rpc(method, timeout, args, kwargs)
+        # Track successful starts from both the public APIs and named worker RPCs.
+        if method == "start_draft_weight_update":
+            self._weight_update_is_draft = True
+        elif method in ("start_weight_update", "finish_weight_update"):
+            self._weight_update_is_draft = False
+        return results
+
+    def finish_weight_update(self, weight_version: str | None = None) -> None:
+        """Commit a target weight label only after all workers finish successfully."""
+        is_draft = self._weight_update_is_draft
+        self.collective_rpc("finish_weight_update")
+        if weight_version is not None and not is_draft:
+            self.set_weight_version(weight_version)
 
     def set_weight_version(self, weight_version: str) -> None:
         self._weight_version = weight_version

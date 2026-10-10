@@ -657,8 +657,9 @@ class OpenAIServingChat(GenerateBaseServing):
                         not delta_text
                         and not output.token_ids
                         and not previous_num_tokens[i]
+                        and output.finish_reason is None
                     ):
-                        # Chunked prefill case, don't return empty chunks
+                        # Skip empty prefill chunks, but always send termination.
                         continue
 
                     delta_message: DeltaMessage | None
@@ -783,6 +784,11 @@ class OpenAIServingChat(GenerateBaseServing):
                             delta=delta_message,
                             logprobs=logprobs,
                             finish_reason=finish_reason_,
+                            weight_versions=(
+                                output.weight_versions
+                                if request.return_weight_versions
+                                else None
+                            ),
                             stop_reason=output.stop_reason,
                             token_ids=(
                                 as_list(output.token_ids) if include_token_ids else None
@@ -1124,6 +1130,9 @@ class OpenAIServingChat(GenerateBaseServing):
                     else None
                 ),
                 routed_experts=routed_experts_b64,
+                weight_versions=(
+                    output.weight_versions if request.return_weight_versions else None
+                ),
             )
             choice_data = maybe_filter_parallel_tool_calls(choice_data, request)
 

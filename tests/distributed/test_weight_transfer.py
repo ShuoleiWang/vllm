@@ -1289,8 +1289,8 @@ class TestTrainerClients:
         assert update_req.update_info == {"names": ["w"]}
 
         client.finish_weight_update("step-42")
-        handle.finish_weight_update.remote.assert_called_once_with()
-        handle.update_weight_version.remote.assert_called_once_with("step-42")
+        handle.finish_weight_update.remote.assert_called_once_with("step-42")
+        handle.update_weight_version.remote.assert_not_called()
 
     def test_http_client_pickles_ipc_handles_for_json(self, monkeypatch):
         """HTTP update_weights must encode raw ipc_handles as a base64 pickle."""

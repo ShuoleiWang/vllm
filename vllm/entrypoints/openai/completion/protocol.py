@@ -24,6 +24,7 @@ from vllm.entrypoints.serve.engine.protocol import OpenAIBaseModel, UsageInfo
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob
+from vllm.outputs import WeightVersionSpan
 from vllm.renderers import TokenizeParams
 from vllm.sampling_params import (
     BeamSearchParams,
@@ -176,6 +177,15 @@ class CompletionRequest(OpenAIBaseModel):
             "need to map generated text back to input tokens."
         ),
     )
+    return_weight_versions: bool = Field(
+        default=False,
+        description=(
+            "Return weight-version spans over generated token indexes, "
+            "excluding the prompt. These are token offsets, not text offsets. "
+            "Streaming returns the spans only on each choice's final chunk, "
+            "including aborted outputs. Not supported with beam search."
+        ),
+    )
     routed_experts_prompt_start: int = Field(
         default=0,
         ge=0,
@@ -273,6 +283,15 @@ class CompletionRequest(OpenAIBaseModel):
     )
 
     # --8<-- [end:completion-extra-params]
+
+    @model_validator(mode="after")
+    def check_weight_versions(self) -> "CompletionRequest":
+        if self.return_weight_versions and self.use_beam_search:
+            raise VLLMValidationError(
+                "`return_weight_versions` is not supported with beam search.",
+                parameter="return_weight_versions",
+            )
+        return self
 
     def build_tok_params(self, model_config: ModelConfig) -> TokenizeParams:
         return TokenizeParams(
@@ -636,6 +655,9 @@ class CompletionLogProbs(OpenAIBaseModel):
 
 class CompletionResponseChoice(OpenAIBaseModel):
     index: int
+    weight_versions: list[WeightVersionSpan] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     text: str
     logprobs: CompletionLogProbs | None = None
     finish_reason: str | None = None
@@ -684,6 +706,9 @@ class CompletionResponse(OpenAIBaseModel):
 
 class CompletionResponseStreamChoice(OpenAIBaseModel):
     index: int
+    weight_versions: list[WeightVersionSpan] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     text: str
     logprobs: CompletionLogProbs | None = None
     finish_reason: str | None = None

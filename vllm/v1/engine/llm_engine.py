@@ -491,6 +491,9 @@ class LLMEngine:
     ) -> list[_R]:
         return self.engine_core.collective_rpc(method, timeout, args, kwargs)
 
+    def finish_weight_update(self, weight_version: str | None = None) -> None:
+        self.engine_core.finish_weight_update(weight_version)
+
     def set_weight_version(self, weight_version: str) -> None:
         self.engine_core.set_weight_version(weight_version)
 
